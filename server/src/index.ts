@@ -6,32 +6,54 @@ import { Node } from "./node.js";
 import { Election } from "./election.js";
 import { registerTools } from "./tools.js";
 import { VERSION } from "./version.js";
+import { RemoteMcpServer } from "./remote-mcp.js";
 
-// Overridable so a fork/test instance can run beside a stock 1994 bridge
-// without joining its leader election. The plugin must be built with the
-// matching VITE_FIGMA_BRIDGE_WS URL (which must also be listed in the
-// plugin manifest's networkAccess.allowedDomains).
 function resolvePort(): number {
   const raw = process.env.FIGMA_BRIDGE_PORT;
   if (raw === undefined) return 1994;
   const port = Number(raw.trim());
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    // An explicitly set but invalid value must not silently join the stock
-    // bridge on 1994 — fail loudly instead.
     console.error(`Invalid FIGMA_BRIDGE_PORT "${raw}" — expected an integer between 1 and 65535`);
     process.exit(1);
   }
   return port;
 }
+
+function resolveOptionalPort(name: string): number | null {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return null;
+
+  const port = Number(raw.trim());
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    console.error(`Invalid ${name} "${raw}" — expected an integer between 1 and 65535`);
+    process.exit(1);
+  }
+  return port;
+}
+
 const PORT = resolvePort();
 
 async function main(): Promise<void> {
   const node = new Node(PORT);
   const election = new Election(PORT, node);
+
+  const remoteMcpPort = resolveOptionalPort("FIGMA_MCP_HTTP_PORT");
+  const remoteMcpHost = process.env.FIGMA_MCP_HTTP_HOST ?? "0.0.0.0";
+  let remoteMcp: RemoteMcpServer | null = null;
+
+  if (remoteMcpPort !== null) {
+    remoteMcp = new RemoteMcpServer(node, {
+      host: remoteMcpHost,
+      port: remoteMcpPort,
+    });
+    await remoteMcp.start();
+  }
+
   await election.start();
 
   let transport: StdioServerTransport | null = null;
   let shuttingDown = false;
+
   const shutdown = async (reason: string, code: number = 0): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -44,7 +66,13 @@ async function main(): Promise<void> {
     force.unref();
 
     election.stop();
+
+    if (remoteMcp) {
+      await remoteMcp.stop();
+    }
+
     node.stop();
+
     if (transport) {
       try {
         await transport.close();
@@ -52,12 +80,12 @@ async function main(): Promise<void> {
         console.error("Transport close error:", err);
       }
     }
+
     process.exit(code);
   };
 
   process.stdin.on("end", () => void shutdown("stdin end"));
   process.stdin.on("close", () => void shutdown("stdin close"));
-
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
   process.on("SIGHUP", () => void shutdown("SIGHUP"));
@@ -66,6 +94,7 @@ async function main(): Promise<void> {
     console.error("Uncaught exception:", err);
     await shutdown("uncaughtException", 1);
   });
+
   process.on("unhandledRejection", (reason) => {
     console.error("Unhandled rejection:", reason);
   });
